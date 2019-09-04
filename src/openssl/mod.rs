@@ -25,6 +25,7 @@
 //! * Verify VRF proof
 use std::fmt;
 use std::{
+    cmp::Ordering,
     fmt::{Debug, Formatter},
     os::raw::c_ulong,
 };
@@ -52,6 +53,7 @@ mod utils;
 pub enum CipherSuite {
     /// `NIST P-256` with `SHA256` and `ECVRF_hash_to_curve_try_and_increment`
     P256_SHA256_TAI,
+    SECP256K1_SHA256_SVDW,
     /// `Secp256k1` with `SHA256` and `ECVRF_hash_to_curve_try_and_increment`
     SECP256K1_SHA256_TAI,
     /// `NIST K-163` with `SHA256` and `ECVRF_hash_to_curve_try_and_increment`
@@ -62,8 +64,22 @@ impl CipherSuite {
     fn suite_string(&self) -> u8 {
         match *self {
             CipherSuite::P256_SHA256_TAI => 0x01,
+            CipherSuite::SECP256K1_SHA256_SVDW => 0xFD,
             CipherSuite::SECP256K1_SHA256_TAI => 0xFE,
             CipherSuite::K163_SHA256_TAI => 0xFF,
+        }
+    }
+
+    /// Get the Z value stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04)
+    /// The properties of each Z value are specified by the hash-to-curve methods
+    /// and the value of Z is determined by the CipherSuite.
+
+    fn get_z_value(&self) -> Option<BigNum> {
+        match *self {
+            CipherSuite::P256_SHA256_TAI => None,
+            CipherSuite::SECP256K1_SHA256_SVDW => Some(BigNum::from_u32(1).unwrap()),
+            CipherSuite::SECP256K1_SHA256_TAI => None,
+            CipherSuite::K163_SHA256_TAI => None,
         }
     }
 }
@@ -112,6 +128,12 @@ pub struct ECVRF {
     hasher: MessageDigest,
     // The order of the curve
     order: BigNum,
+    // Coefficient of the linear term of the curve
+    a: BigNum,
+    // Constant term of the curve
+    b: BigNum,
+    // EC characteristic
+    p: BigNum,
     // Length of the order of the curve in bits
     qlen: usize,
     // 2n = length of a field element in bits rounded up to the nearest even integer
@@ -123,6 +145,7 @@ impl Debug for ECVRF {
         fmt.debug_struct("ECVRF")
             .field("cipher_suite", &self.cipher_suite)
             .field("cofactor", &self.cofactor)
+            .field("p", &self.p)
             .field("qlen", &self.qlen)
             .field("n", &self.n)
             .field("order", &self.order)
@@ -150,6 +173,7 @@ impl ECVRF {
                 (EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?, 0x01)
             }
             CipherSuite::K163_SHA256_TAI => (EcGroup::from_curve_name(Nid::SECT163K1)?, 0x02),
+            CipherSuite::SECP256K1_SHA256_SVDW => (EcGroup::from_curve_name(Nid::SECP256K1)?, 0x01),
             CipherSuite::SECP256K1_SHA256_TAI => (EcGroup::from_curve_name(Nid::SECP256K1)?, 0x01),
         };
 
@@ -171,6 +195,9 @@ impl ECVRF {
             group,
             bn_ctx,
             order,
+            a,
+            b,
+            p,
             hasher,
             n,
             qlen,
@@ -322,6 +349,380 @@ impl ECVRF {
         }
         // Return error if no valid point was found
         point.ok_or(Error::HashToPointError)
+    }
+
+    // Utility function used in hash-to-curve methods.
+    // For security reasons, all field operations, comparisons and assignments MUST be implemented in constant time
+    // (i.e., execution time MUST NOT depend on the values of the inputs), and without branching.
+
+    /// Function to move a field element conditionally.
+    /// Stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04#section-4)
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `a` - A field element over F
+    /// * `b` - A field element over F
+    /// * `c` - A boolean value
+    ///
+    /// # Returns
+    ///
+    /// * If c is False, CMOV returns a otherwise b
+    fn cmov(a: BigNum, b: BigNum, c: bool) -> BigNum {
+        // FIXME: This function has not been confirmed to have constant time
+        if c {
+            b
+        } else {
+            a
+        }
+    }
+
+    fn icmov(a: i32, b: i32, c: bool) -> i32 {
+        // FIXME: This function has not been confirmed to have constant time
+        if c {
+            b
+        } else {
+            a
+        }
+    }
+
+    /// Function to check whether the given field element is square or not.
+    /// Stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04#section-4)
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - A field element over F
+    ///
+    /// # Returns
+    ///
+    /// * Returns true whenever the value x is a square in the field given F, otherwise false.
+
+    #[allow(clippy::wrong_self_convention)]
+    fn is_square(&mut self, x: &BigNum) -> Result<bool, Error> {
+        assert_eq!(
+            x.ucmp(&self.p),
+            Ordering::Less,
+            "The argument {} must be smaller than the # of field elements {}",
+            x,
+            self.p
+        );
+        let one = BigNum::from_u32(1)?;
+        let two = BigNum::from_u32(2)?;
+
+        let mut inv2 = BigNum::new()?;
+        inv2.mod_inverse(&two, &self.p, &mut self.bn_ctx)?;
+
+        let mut qm1 = BigNum::new()?;
+        qm1.mod_sub(&self.p, &one, &self.p, &mut self.bn_ctx)?;
+        let mut qm1d2 = BigNum::new()?;
+        qm1d2.mod_mul(&qm1, &inv2, &self.p, &mut self.bn_ctx)?;
+
+        let mut criterion = BigNum::new()?;
+        criterion.mod_exp(x, &qm1d2, &self.p, &mut self.bn_ctx)?;
+        Ok(criterion.ucmp(&one) != Ordering::Greater)
+    }
+
+    /// Function to get the square root of a field element
+    /// Stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04#section-4)
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - A field element over F
+    ///
+    /// # Returns
+    ///
+    /// * s, An element of field F such that s^2 == x
+    fn sqrt(&mut self, x: &BigNum) -> Result<BigNum, Error> {
+        // NOTICE: this function is not generalized for all possible q values. Moreover, the preferred way of computing
+        // square roots is to fix a determinisitc algorithm particular to the field F unlike the generalized big number
+        // libraries' mod_sqrt methods.
+
+        assert_eq!(
+            x.ucmp(&self.p),
+            Ordering::Less,
+            "The argument {} must be smaller than the # of field elements {}",
+            x,
+            self.p
+        );
+
+        let one = BigNum::from_u32(1)?;
+        let four = BigNum::from_u32(4)?;
+
+        let mut inv4 = BigNum::new()?;
+        inv4.mod_inverse(&four, &self.p, &mut self.bn_ctx)?;
+
+        let mut qp1 = BigNum::new()?;
+        qp1.mod_add(&self.p, &one, &self.p, &mut self.bn_ctx)?;
+        let mut qp1d4 = BigNum::new()?;
+        qp1d4.mod_mul(&qp1, &inv4, &self.p, &mut self.bn_ctx)?;
+
+        let mut result = BigNum::new()?;
+        result.mod_exp(x, &qp1d4, &self.p, &mut self.bn_ctx)?;
+        Ok(result)
+    }
+
+    /// Function to get the modular inverse of a field element in the field F
+    /// Stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04#section-4)
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - A field element over F
+    ///
+    /// # Returns
+    ///
+    /// * multiplicative inverse of x in F
+    fn inv0(&mut self, x: &BigNum) -> Result<BigNum, Error> {
+        assert_eq!(
+            x.ucmp(&self.p),
+            Ordering::Less,
+            "The argument {} must be smaller than the # of field elements {}",
+            x,
+            self.p
+        );
+
+        let two = BigNum::from_u32(2)?;
+
+        let mut qm2 = BigNum::new()?;
+        qm2.mod_sub(&self.p, &two, &self.p, &mut self.bn_ctx)?;
+
+        let mut result = BigNum::new()?;
+        result.mod_exp(x, &qm2, &self.p, &mut self.bn_ctx)?;
+        Ok(result)
+    }
+
+    /// Function to get the sign of a field element
+    /// Stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04#section-4)
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - A field element over F
+    ///
+    /// # Returns
+    ///
+    /// * -1 or 1
+    fn sgn0(&mut self, x: &BigNum) -> Result<i32, Error> {
+        assert_eq!(
+            x.ucmp(&self.p),
+            Ordering::Less,
+            "The argument {} must be smaller than the # of field elements {}",
+            x,
+            self.p
+        );
+
+        // This function is not yet generalized for (m > 1)
+        let mut sign = 0i32;
+        let zero = BigNum::from_u32(0)?;
+        let one = BigNum::from_u32(1)?;
+        let two = BigNum::from_u32(2)?;
+
+        let mut pm1 = BigNum::new()?;
+        pm1.mod_sub(&self.p, &one, &self.p, &mut self.bn_ctx)?;
+        let mut inv2 = BigNum::new()?;
+        inv2.mod_inverse(&two, &self.p, &mut self.bn_ctx)?;
+        let mut pm1d2 = BigNum::new()?;
+        pm1d2.mod_mul(&pm1, &inv2, &self.p, &mut self.bn_ctx)?;
+
+        let criterion = x.ucmp(&pm1d2) == Ordering::Greater;
+        let mut sign_0 = ECVRF::icmov(1, -1, criterion);
+        sign_0 = ECVRF::icmov(sign_0, 0, x.ucmp(&zero) == Ordering::Equal);
+        sign = ECVRF::icmov(sign, sign_0, sign == 0);
+
+        Ok(ECVRF::icmov(sign, 1, sign == 0))
+    }
+
+    /// Function to get the value of squared y on the curve
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - A field element over F
+    ///
+    /// # Returns
+    ///
+    /// * the value of x^3 + a * x + b
+    fn get_squared_y(&mut self, x: &BigNum) -> Result<BigNum, Error> {
+        assert_eq!(
+            x.ucmp(&self.p),
+            Ordering::Less,
+            "The argument {} must be smaller than the # of field elements {}",
+            x,
+            self.p
+        );
+
+        let mut xsquare = BigNum::new()?;
+        xsquare.mod_sqr(x, &self.p, &mut self.bn_ctx)?;
+        let mut xqubic = BigNum::new()?;
+        xqubic.mod_mul(&xsquare, x, &self.p, &mut self.bn_ctx)?;
+
+        let mut ax = BigNum::new()?;
+        ax.mod_mul(x, &self.a, &self.p, &mut self.bn_ctx)?;
+
+        let mut xcubic_plus_ax = BigNum::new()?;
+        xcubic_plus_ax.mod_add(&xqubic, &ax, &self.p, &mut self.bn_ctx)?;
+        let mut ysquare = BigNum::new()?;
+        ysquare.mod_add(&xcubic_plus_ax, &self.b, &self.p, &mut self.bn_ctx)?;
+
+        Ok(ysquare)
+    }
+
+    /// Function to convert a `Hash(PK|DATA)` to a point in the curve in constant time.
+    /// Stated in [hash-to-curve-04](https://tools.ietf.org/html/draft-irtf-cfrg-hash-to-curve-04#section-6.9.1)
+    ///
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - An `EcPoint` referencing the public key.
+    /// * `alpha` - A slice containing the input data.
+    ///
+    /// # Returns
+    ///
+    /// * If successful, an `EcPoint` representing the hashed point.
+    #[allow(clippy::many_single_char_names)]
+    fn hash_to_point_svdw(&mut self, public_key: &EcPoint, alpha: &[u8]) -> Result<EcPoint, Error> {
+        let z = self
+            .cipher_suite
+            .get_z_value()
+            .expect("There must be a Z value meeting all criteria specified in the SVDW method");
+        let pk_bytes = public_key.to_bytes(
+            &self.group,
+            PointConversionForm::COMPRESSED,
+            &mut self.bn_ctx,
+        )?;
+        let cipher = [self.cipher_suite.suite_string(), 0x01];
+        let v = [&cipher[..], &pk_bytes[..], &alpha[..]].concat();
+        let hash = hash(self.hasher, &v).unwrap();
+        let u = BigNum::from_slice(&hash)?;
+
+        // Constants
+        let two = BigNum::from_u32(2)?;
+        let three = BigNum::from_u32(3)?;
+        let mut minus3 = BigNum::new()?;
+        minus3.mod_sub(BigNum::new()?.as_ref(), &three, &self.p, &mut self.bn_ctx)?;
+        let mut inv2 = BigNum::new()?;
+        inv2.mod_inverse(&two, &self.p, &mut self.bn_ctx)?;
+
+        // c1 = g(Z)
+        let c1 = self.get_squared_y(&z)?;
+
+        // c2 = sqrt(-3 * Z^2)
+        let mut zsquare = BigNum::new()?;
+        zsquare.mod_sqr(&z, &self.p, &mut self.bn_ctx)?;
+        let mut _c2 = BigNum::new()?;
+        _c2.mod_mul(&minus3, &zsquare, &self.p, &mut self.bn_ctx)?;
+        let c2 = self.sqrt(&_c2)?;
+
+        // c3 = (sqrt(-3 * Z^2) - Z) / 2
+        let mut _c3 = BigNum::new()?;
+        _c3.mod_sub(&c2, &z, &self.p, &mut self.bn_ctx)?;
+        let mut c3 = BigNum::new()?;
+        c3.mod_mul(&_c3, &inv2, &self.p, &mut self.bn_ctx)?;
+
+        // c4 = (sqrt(-3 * Z^2) + Z) / 2
+        let mut _c4 = BigNum::new()?;
+        _c4.mod_add(&c2, &z, &self.p, &mut self.bn_ctx)?;
+        let mut c4 = BigNum::new()?;
+        c4.mod_mul(&_c4, &inv2, &self.p, &mut self.bn_ctx)?;
+
+        // c5 = 1 / (3 * Z^2)
+        let mut _c5 = BigNum::new()?;
+        _c5.mod_mul(&three, &zsquare, &self.p, &mut self.bn_ctx)?;
+        let mut c5 = BigNum::new()?;
+        c5.mod_inverse(&_c5, &self.p, &mut self.bn_ctx)?;
+
+        //  1.   t1 = u^2
+        let mut t1 = BigNum::new()?;
+        t1.mod_sqr(&u, &self.p, &mut self.bn_ctx)?;
+        //  2.   t2 = t1 + c1           // t2 = u^2 + g(Z)
+        let mut t2 = BigNum::new()?;
+        t2.mod_add(&t1, &c1, &self.p, &mut self.bn_ctx)?;
+        //  3.   t3 = t1 * t2
+        let mut t3 = BigNum::new()?;
+        t3.mod_mul(&t1, &t2, &self.p, &mut self.bn_ctx)?;
+        //  4.   t4 = inv0(t3)          // t4 = 1 / (u^2 * (u^2 + g(Z)))
+        let t4 = self.inv0(&t3)?;
+        //  5.   t3 = t1^2
+        t3.mod_sqr(&t1, &self.p, &mut self.bn_ctx)?;
+        //  6.   t3 = t3 * t4
+        let mut _t3 = BigNum::new()?;
+        _t3.mod_mul(&t3, &t4, &self.p, &mut self.bn_ctx)?;
+        //  7.   t3 = t3 * c2           // t3 = u^2 * sqrt(-3 * Z^2) / (u^2 + g(Z))
+        t3.mod_mul(&_t3, &c2, &self.p, &mut self.bn_ctx)?;
+        //  8.   x1 = c3 - t3
+        let mut x1 = BigNum::new()?;
+        x1.mod_sub(&c3, &t3, &self.p, &mut self.bn_ctx)?;
+        //  9.  gx1 = x1^2
+        let mut gx1 = BigNum::new()?;
+        gx1.mod_sqr(&x1, &self.p, &mut self.bn_ctx)?;
+        //  10. gx1 = gx1 * x1
+        let mut _gx1 = BigNum::new()?;
+        _gx1.mod_mul(&gx1, &x1, &self.p, &mut self.bn_ctx)?;
+        //  11. gx1 = gx1 + B           // gx1 = x1^3 + B
+        gx1.mod_add(&_gx1, &self.b, &self.p, &mut self.bn_ctx)?;
+        //  12.  e1 = is_square(gx1)
+        let e1 = self.is_square(&gx1)?;
+        //  13.  x2 = t3 - c4
+        let mut x2 = BigNum::new()?;
+        x2.mod_sub(&t3, &c4, &self.p, &mut self.bn_ctx)?;
+        //  14. gx2 = x2^2
+        let mut gx2 = BigNum::new()?;
+        gx2.mod_sqr(&x2, &self.p, &mut self.bn_ctx)?;
+        //  15. gx2 = gx2 * x2
+        let mut _gx2 = BigNum::new()?;
+        _gx2.mod_mul(&gx2, &x2, &self.p, &mut self.bn_ctx)?;
+        //  16. gx2 = gx2 + B           // gx2 = x2^3 + B
+        gx2.mod_add(&_gx2, &self.b, &self.p, &mut self.bn_ctx)?;
+        //  17.  e2 = is_square(gx2)
+        let e2 = self.is_square(&gx2)?;
+        //  18.  e3 = e1 OR e2          // logical OR
+        let e3 = e1 || e2;
+        //  19.  x3 = t2^2
+        let mut x3 = BigNum::new()?;
+        x3.mod_sqr(&t2, &self.p, &mut self.bn_ctx)?;
+        //  20.  x3 = x3 * t2
+        let mut _x3 = BigNum::new()?;
+        _x3.mod_mul(&x3, &t2, &self.p, &mut self.bn_ctx)?;
+        //  21.  x3 = x3 * t4
+        x3.mod_mul(&_x3, &t4, &self.p, &mut self.bn_ctx)?;
+        //  22.  x3 = x3 * c5
+        _x3.mod_mul(&x3, &c5, &self.p, &mut self.bn_ctx)?;
+        //  23.  x3 = Z - x3            // Z - (u^2 + g(Z))^2 / (3 Z^2 u^2)
+        x3.mod_sub(&z, &_x3, &self.p, &mut self.bn_ctx)?;
+        //  24. gx3 = x3^2
+        let mut gx3 = BigNum::new()?;
+        gx3.mod_sqr(&x3, &self.p, &mut self.bn_ctx)?;
+        //  25. gx3 = gx3 * x3
+        let mut _gx3 = BigNum::new()?;
+        _gx3.mod_mul(&gx3, &x3, &self.p, &mut self.bn_ctx)?;
+        //  26. gx3 = gx3 + B           // gx3 = x3^3 + B
+        gx3.mod_add(&_gx3, &self.b, &self.p, &mut self.bn_ctx)?;
+        //  27.   x = CMOV(x2, x1, e1)  // select x1 if gx1 is square
+        let mut x = ECVRF::cmov(x2, x1, e1);
+        //  28.  gx = CMOV(gx2, gx1, e1)
+        let mut gx = ECVRF::cmov(gx2, gx1, e1);
+        //  29.   x = CMOV(x3, x, e3)   // select x3 if gx1 and gx2 are not square
+        x = ECVRF::cmov(x3, x, e3);
+        //  30.  gx = CMOV(gx3, gx, e3)
+        gx = ECVRF::cmov(gx3, gx, e3);
+        //  31.   y = sqrt(gx)
+        let mut y = self.sqrt(&gx)?;
+        //  32.  e4 = sgn0(u) == sgn0(y)
+        let e4 = self.sgn0(&u)? == self.sgn0(&y)?;
+        //  33.   y = CMOV(-y, y, e4)   // select correct sign of y
+        let mut my = BigNum::new()?;
+        my.mod_sub(BigNum::new()?.as_ref(), &y, &self.p, &mut self.bn_ctx)?;
+        y = ECVRF::cmov(my, y, e4);
+        //  34. return (x, y)
+        // Using uncompressed form
+        let mut v = vec![0x04];
+        v.extend(x.to_vec());
+        v.extend(y.to_vec());
+        assert_eq!(v.len(), 65);
+        let point = EcPoint::from_bytes(&self.group, &v, &mut self.bn_ctx)?;
+        Ok(point)
     }
 
     /// Function to convert an arbitrary string to a point in the curve as specified in VRF-draft-05
@@ -487,7 +888,12 @@ impl VRF<&[u8], &[u8]> for ECVRF {
         let public_key_point = self.derive_public_key_point(&secret_key)?;
 
         // Step 2: Hash to curve
-        let h_point = self.hash_to_try_and_increment(&public_key_point, alpha)?;
+        let h_point = match self.cipher_suite {
+            CipherSuite::SECP256K1_SHA256_SVDW => {
+                self.hash_to_point_svdw(&public_key_point, alpha)?
+            }
+            _ => self.hash_to_try_and_increment(&public_key_point, alpha)?,
+        };
 
         // Step 3: point to string
         let h_string = h_point.to_bytes(
@@ -545,7 +951,12 @@ impl VRF<&[u8], &[u8]> for ECVRF {
 
         // Step 2: hash to curve
         let public_key_point = EcPoint::from_bytes(&self.group, &y, &mut self.bn_ctx)?;
-        let h_point = self.hash_to_try_and_increment(&public_key_point, alpha)?;
+        let h_point = match self.cipher_suite {
+            CipherSuite::SECP256K1_SHA256_SVDW => {
+                self.hash_to_point_svdw(&public_key_point, alpha)?
+            }
+            _ => self.hash_to_try_and_increment(&public_key_point, alpha)?,
+        };
 
         // Step 3: U = sB -cY
         let mut s_b = EcPoint::new(&self.group.as_ref())?;
