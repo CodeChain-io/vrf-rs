@@ -337,15 +337,17 @@ impl ECVRF {
             }
         });
 
-        if let Some(pt) = point.as_mut() {
-            let mut new_pt = EcPoint::new(&self.group.as_ref())?;
-            new_pt.mul(
-                &self.group.as_ref(),
-                &pt,
-                &BigNum::from_slice(&[self.cofactor])?.as_ref(),
-                &self.bn_ctx,
-            )?;
-            *pt = new_pt;
+        if self.cofactor != 1 {
+            if let Some(pt) = point.as_mut() {
+                let mut new_pt = EcPoint::new(&self.group.as_ref())?;
+                new_pt.mul(
+                    &self.group.as_ref(),
+                    &pt,
+                    &BigNum::from_slice(&[self.cofactor])?.as_ref(),
+                    &self.bn_ctx,
+                )?;
+                *pt = new_pt;
+            }
         }
         // Return error if no valid point was found
         point.ok_or(Error::HashToPointError)
