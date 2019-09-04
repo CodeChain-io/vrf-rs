@@ -718,8 +718,12 @@ impl ECVRF {
         //  34. return (x, y)
         // Using uncompressed form
         let mut v = vec![0x04];
-        v.extend(x.to_vec());
-        v.extend(y.to_vec());
+        let x_vec = x.to_vec();
+        let y_vec = y.to_vec();
+        v.extend(vec![0; 32 - x_vec.len()]);
+        v.extend(x_vec);
+        v.extend(vec![0; 32 - y_vec.len()]);
+        v.extend(y_vec);
         assert_eq!(v.len(), 65);
         let point = EcPoint::from_bytes(&self.group, &v, &mut self.bn_ctx)?;
         Ok(point)
