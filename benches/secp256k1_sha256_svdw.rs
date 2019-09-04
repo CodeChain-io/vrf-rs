@@ -11,7 +11,7 @@ use test::Bencher;
 use vrf::openssl::{CipherSuite, ECVRF};
 use vrf::VRF;
 
-const SUITE: CipherSuite = CipherSuite::SECP256K1_SHA256_TAI;
+const SUITE: CipherSuite = CipherSuite::SECP256K1_SHA256_SVDW;
 
 #[bench]
 fn bench_prove(b: &mut Bencher) {
