@@ -5,7 +5,7 @@
 //! 1. Instantiate the `ECVRF` by specifying the `CipherSuite`
 //! 2. Generate a VRF proof by using the `prove()` function
 //! 3. (Optional) Convert the VRF proof to a hash (e.g. to be used as pseudo-random value)
-//! 4. Verify a VRF proof by using `verify()` function
+//! 4. Verify the VRF proof by using `verify()` function
 
 use vrf::openssl::{CipherSuite, ECVRF};
 use vrf::VRF;
