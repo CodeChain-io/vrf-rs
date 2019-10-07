@@ -23,7 +23,7 @@ fn main() {
     let mut seed = vrf.proof_to_hash(&pi).unwrap();
     let mut output = File::create("foo.txt").unwrap();
 
-    for _ in 0..1000000 {
+    for _ in 0..1_000_000 {
         let pi = vrf.prove(&secret_key, &seed.to_vec()).unwrap();
         seed = vrf.proof_to_hash(&pi).unwrap();
         output.write(&seed).unwrap();
