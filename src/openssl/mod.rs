@@ -53,6 +53,7 @@ mod utils;
 pub enum CipherSuite {
     /// `NIST P-256` with `SHA256` and `ECVRF_hash_to_curve_try_and_increment`
     P256_SHA256_TAI,
+    /// `Secp256k1` with `SHA256` and `ECVRF_hash_to_curve_Shallue-van_de_Woestijne_Method`
     SECP256K1_SHA256_SVDW,
     /// `Secp256k1` with `SHA256` and `ECVRF_hash_to_curve_try_and_increment`
     SECP256K1_SHA256_TAI,
